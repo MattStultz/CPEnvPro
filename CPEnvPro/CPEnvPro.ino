@@ -22,7 +22,7 @@
  *   m                        - open menu (from dashboard) / back to dashboard
  *   ; / .                    - scroll menu, status rows, scan list, or interval list
  *   , / /                    - graph mode only: previous / next metric
- *   space                    - toggle temperature unit C / F (dashboard only)
+ *   space                    - toggle temperature unit C / F (dashboard, and the TEMP graph)
  *   Fn+Backspace             - cancel out of WiFi password or log filename entry
  *   (while typing a password or filename, all keys above type normally instead)
  *
@@ -215,6 +215,8 @@ String logActiveFilename;
 // ---- graph state -----------------------------------------------------
 // csvCol matches logWriteTick()'s fixed header order: timestamp,temperature_c,
 // humidity_pct,pressure_hpa,gas_ohm,iaq,co2eq_ppm,battery_pct.
+// Index 0 must stay TEMP — drawGraphView()'s space-key C/F toggle is gated
+// on graphMetricIndex == 0, not on the label text.
 struct GraphMetricInfo {
     const char* label;
     const char* unit;
@@ -361,9 +363,13 @@ void drawDashboard() {
         r1 = 35;
         r0 = 27;
     } else {
+        // Gauge centers are 80px apart (x=40,120,200), so diameter (2*r1) has
+        // to stay under 80 or adjacent circles overlap — r1=48 didn't (96px
+        // diameter). 38 leaves a 4px gap while still being noticeably bigger
+        // than the Pro layout's cramped 35.
         gaugeY = HEADER_H + 60;
-        r1 = 48;
-        r0 = 38;
+        r1 = 38;
+        r0 = 29;
     }
     drawRingGauge(40, gaugeY, r1, r0, tempPct, COL_CYAN, tempStr.c_str(), "TEMP");
     drawRingGauge(120, gaugeY, r1, r0, humPct, COL_PINK, humStr.c_str(), "HUM");
@@ -1441,6 +1447,11 @@ void drawGraphView() {
     drawHeader();
 
     const GraphMetricInfo& m = kGraphMetrics[graphMetricIndex];
+    // Same space-key toggle as the dashboard, and the same shared preference
+    // — only meaningful (and only wired up) on the TEMP graph.
+    bool showFahrenheit = (graphMetricIndex == 0) && useFahrenheit;
+    const char* unitLabel = showFahrenheit ? "F" : m.unit;
+    auto dispVal = [&](int i) { return showFahrenheit ? (graphBuffer[i] * 9.0f / 5.0f + 32.0f) : graphBuffer[i]; };
 
     if (!graphHasFile) {
         canvas.setTextDatum(middle_center);
@@ -1463,8 +1474,9 @@ void drawGraphView() {
     bool haveRange = false;
     for (int i = 0; i < graphPointCount; i++) {
         if (isnan(graphBuffer[i])) continue;
-        if (graphBuffer[i] < minV) minV = graphBuffer[i];
-        if (graphBuffer[i] > maxV) maxV = graphBuffer[i];
+        float v = dispVal(i);
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
         haveRange = true;
     }
     if (!haveRange) {
@@ -1488,23 +1500,31 @@ void drawGraphView() {
     canvas.drawString(fmt1(maxV), 2, plotTop);
     canvas.drawString(fmt1(minV), 2, plotBottom - 8);
 
+    // Buckets are spaced by time, not by row density, so real readings are
+    // routinely several buckets apart (e.g. a 10s logging interval only
+    // fills 1 bucket in 7 once the span is more than ~4 minutes). Connecting
+    // only strictly-adjacent buckets meant almost nothing ever had a
+    // non-empty neighbor, so no line ever drew despite valid data. Instead,
+    // connect each real bucket straight to the *next* real one, however many
+    // empty buckets sit between — the standard "skip nulls" convention.
+    auto plotX = [&](int idx) {
+        return plotLeft + (graphPointCount > 1 ? (int)((long)idx * plotW / (graphPointCount - 1)) : 0);
+    };
+    auto plotY = [&](float v) { return plotBottom - (int)((v - minV) / (maxV - minV) * plotH); };
+
     int lastValidIdx = -1;
-    for (int i = 1; i < graphPointCount; i++) {
-        int x0 = plotLeft + (graphPointCount > 1 ? (int)((long)(i - 1) * plotW / (graphPointCount - 1)) : 0);
-        int x1 = plotLeft + (graphPointCount > 1 ? (int)((long)i * plotW / (graphPointCount - 1)) : plotW);
-        if (!isnan(graphBuffer[i - 1]) && !isnan(graphBuffer[i])) {
-            int y0 = plotBottom - (int)((graphBuffer[i - 1] - minV) / (maxV - minV) * plotH);
-            int y1 = plotBottom - (int)((graphBuffer[i] - minV) / (maxV - minV) * plotH);
-            canvas.drawLine(x0, y0, x1, y1, m.color);
+    for (int i = 0; i < graphPointCount; i++) {
+        if (isnan(graphBuffer[i])) continue;
+        if (lastValidIdx >= 0) {
+            canvas.drawLine(plotX(lastValidIdx), plotY(dispVal(lastValidIdx)), plotX(i), plotY(dispVal(i)), m.color);
         }
-        if (!isnan(graphBuffer[i])) lastValidIdx = i;
+        lastValidIdx = i;
     }
-    if (lastValidIdx < 0 && !isnan(graphBuffer[0])) lastValidIdx = 0;
 
     canvas.setTextDatum(bottom_left);
     canvas.setTextColor(m.color, TFT_TRANSPARENT);
-    String latest = lastValidIdx >= 0 ? fmt1(graphBuffer[lastValidIdx]) : "--";
-    canvas.drawString(String(m.label) + " " + latest + m.unit, 4, SCREEN_H - 2);
+    String latest = lastValidIdx >= 0 ? fmt1(dispVal(lastValidIdx)) : "--";
+    canvas.drawString(String(m.label) + " " + latest + unitLabel, 4, SCREEN_H - 2);
 
     canvas.setTextDatum(bottom_right);
     canvas.setTextColor(COL_TEXT_DIM, TFT_TRANSPARENT);
@@ -1619,6 +1639,10 @@ void handleInput() {
             }
             if (curSpace && !prevKeys.space && appState == STATE_DASHBOARD) {
                 useFahrenheit = !useFahrenheit;
+            }
+            if (curSpace && !prevKeys.space && appState == STATE_GRAPH && graphMetricIndex == 0) {
+                useFahrenheit = !useFahrenheit;  // same shared preference as the dashboard
+                forceRedraw = true;
             }
             if (appState == STATE_MENU) {
                 if (curUp && !prevKeys.up) menuSelected = (menuSelected - 1 + kMenuCount) % kMenuCount;
